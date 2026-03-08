@@ -11,104 +11,96 @@ import os
 
 print("Starting model training process...")
 
-# 1. Create Mock CICIDS2017 Dataset
-# The 16 core features we can reliably extract using scapy
-FEATURES = [
-    'Flow Duration',
-    'Total Fwd Packets',
-    'Total Backward Packets',
-    'Total Length of Fwd Packets',
-    'Total Length of Bwd Packets',
-    'Fwd Packet Length Max',
-    'Fwd Packet Length Min',
-    'Bwd Packet Length Max',
-    'Bwd Packet Length Min',
-    'Flow Bytes/s',
-    'Flow Packets/s',
-    'FIN Flag Count',
-    'SYN Flag Count',
-    'RST Flag Count',
-    'PSH Flag Count',
-    'ACK Flag Count'
-]
+# 1. Load Real CICIDS2017 Dataset Sample
+if not os.path.exists("cicids2017_real_sample.csv"):
+    print("Error: real sample not found.")
+    exit(1)
 
-def generate_mock_data(n_samples=5000):
-    np.random.seed(42)
-    data = {}
+df = pd.read_csv("cicids2017_real_sample.csv")
 
-    for feature in FEATURES:
-        # Generate some semi-realistic numbers
-        if 'Flag' in feature:
-            data[feature] = np.zeros(n_samples) # Mostly benign, no flags
-        elif 'Duration' in feature:
-            data[feature] = np.random.exponential(500, n_samples)
-        elif 'Length' in feature:
-            data[feature] = np.random.normal(100, 20, n_samples)
-        else:
-            data[feature] = np.random.rand(n_samples) * 10
+# Ensure dataset size is manageable but large enough
+if len(df) > 200000:
+    # Stratified downsample to 200k to ensure KNN and RF train in reasonable time
+    # (KNN takes forever on 600k samples)
+    df = df.groupby('Label', group_keys=False).apply(lambda x: x.sample(min(len(x), int(200000 * len(x)/len(df))), random_state=42))
 
-    df = pd.DataFrame(data)
+feature_mapping = {
+    'Flow Duration': 'Flow Duration',
+    'Total Fwd Packet': 'Total Fwd Packets',
+    'Total Bwd packets': 'Total Backward Packets',
+    'Total Length of Fwd Packet': 'Total Length of Fwd Packets',
+    'Total Length of Bwd Packet': 'Total Length of Bwd Packets',
+    'Fwd Packet Length Max': 'Fwd Packet Length Max',
+    'Fwd Packet Length Min': 'Fwd Packet Length Min',
+    'Bwd Packet Length Max': 'Bwd Packet Length Max',
+    'Bwd Packet Length Min': 'Bwd Packet Min', # Note: 'Bwd Packet Min' should map to 'Bwd Packet Length Min'
+    'Flow Bytes/s': 'Flow Bytes/s',
+    'Flow Packets/s': 'Flow Packets/s',
+    'FIN Flag Count': 'FIN Flag Count',
+    'SYN Flag Count': 'SYN Flag Count',
+    'RST Flag Count': 'RST Flag Count',
+    'PSH Flag Count': 'PSH Flag Count',
+    'ACK Flag Count': 'ACK Flag Count'
+}
 
-    # Mostly benign
-    labels = np.random.choice(
-        ['BENIGN', 'DoS Hulk', 'PortScan', 'DDoS', 'Bot', 'FTP-Patator', 'SSH-Patator', 'Web Attack - Brute Force'],
-        n_samples,
-        p=[0.9, 0.02, 0.02, 0.02, 0.01, 0.01, 0.01, 0.01]
-    )
-    df['Label'] = labels
+# The actual column name in bvk dataset might be slightly different. Let's fix mapping
+feature_mapping['Bwd Packet Length Min'] = 'Bwd Packet Length Min'
 
-    # Introduce explicit, very strong patterns so the model learns them flawlessly and doesn't hallucinate
+df.rename(columns=feature_mapping, inplace=True)
+FEATURES = list(feature_mapping.values())
 
-    # Benign: small packets, few flags
-    benign_idx = df['Label'] == 'BENIGN'
-    df.loc[benign_idx, 'Flow Bytes/s'] = np.random.uniform(10, 500, sum(benign_idx))
-    df.loc[benign_idx, 'Flow Packets/s'] = np.random.uniform(1, 50, sum(benign_idx))
+# Clean up infinite values and NaN
+df.replace([np.inf, -np.inf], np.nan, inplace=True)
+df.dropna(subset=FEATURES + ['Label'], inplace=True)
 
-    # PortScan: Lots of SYN flags, small packets, high packet rate
-    portscan_idx = df['Label'] == 'PortScan'
-    df.loc[portscan_idx, 'SYN Flag Count'] = 1
-    df.loc[portscan_idx, 'Flow Packets/s'] = np.random.uniform(5000, 20000, sum(portscan_idx))
-    df.loc[portscan_idx, 'Flow Duration'] = np.random.uniform(1, 10, sum(portscan_idx))
+# Merge detailed attempts into main categories
+df['Label'] = df['Label'].replace({
+    'Infiltration - Portscan': 'PortScan',
+    'Infiltration': 'Infiltration',
+    'Infiltration - Attempted': 'Infiltration',
+    'DoS Hulk - Attempted': 'DoS Hulk',
+    'Botnet - Attempted': 'Bot',
+    'Botnet': 'Bot',
+    'DoS Slowloris': 'DoS',
+    'DoS Slowhttptest': 'DoS',
+    'DoS Slowloris - Attempted': 'DoS',
+    'DoS Slowhttptest - Attempted': 'DoS',
+    'DoS GoldenEye': 'DoS',
+    'DoS GoldenEye - Attempted': 'DoS',
+    'Web Attack - Brute Force - Attempted': 'Web Attack',
+    'Web Attack - XSS - Attempted': 'Web Attack',
+    'Web Attack - Brute Force': 'Web Attack',
+    'Web Attack - SQL Injection': 'Web Attack',
+    'Web Attack - SQL Injection - Attempted': 'Web Attack',
+    'Web Attack - XSS': 'Web Attack',
+    'FTP-Patator - Attempted': 'FTP-Patator',
+    'SSH-Patator - Attempted': 'SSH-Patator',
+    'DDoS': 'DDoS',
+    'Portscan': 'PortScan',
+    'Heartbleed': 'Heartbleed'
+})
 
-    # DoS Hulk/DDoS: Huge packet rate, large flows
-    dos_idx = df['Label'].isin(['DoS Hulk', 'DDoS'])
-    df.loc[dos_idx, 'Flow Packets/s'] = np.random.uniform(50000, 200000, sum(dos_idx))
-    df.loc[dos_idx, 'Total Length of Fwd Packets'] = np.random.uniform(10000, 50000, sum(dos_idx))
-
-    # Web Attack: Large payloads
-    web_idx = df['Label'] == 'Web Attack - Brute Force'
-    df.loc[web_idx, 'Fwd Packet Length Max'] = np.random.uniform(2000, 5000, sum(web_idx))
-
-    # Bot/Patator: Long durations, periodic
-    bot_idx = df['Label'].isin(['Bot', 'FTP-Patator', 'SSH-Patator'])
-    df.loc[bot_idx, 'Flow Duration'] = np.random.uniform(500000, 1000000, sum(bot_idx))
-
-    return df
-
-print("Generating better synthetic dataset...")
-df = generate_mock_data(n_samples=20000)
-df.to_csv("cicids2017_sample.csv", index=False)
-print("Saved sample dataset to cicids2017_sample.csv")
+print(f"Data ready for training. Shape: {df.shape}")
+print(df['Label'].value_counts())
 
 # 2. Preprocessing
 X = df[FEATURES]
 y = df['Label']
 
-# Encode labels
 encoder = LabelEncoder()
 y_encoded = encoder.fit_transform(y)
 
-# Scale features
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
 X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_encoded, test_size=0.2, random_state=42)
 
 # 3. Train Models
+# Including KNN as explicitly requested by the user previously
 models = {
-    "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
-    "XGBoost": xgb.XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=42),
-    "KNN": KNeighborsClassifier(n_neighbors=5)
+    "Random Forest": RandomForestClassifier(n_estimators=50, max_depth=15, n_jobs=-1, random_state=42),
+    "XGBoost": xgb.XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=42, n_jobs=-1, max_depth=8),
+    "KNN": KNeighborsClassifier(n_neighbors=5, n_jobs=-1)
 }
 
 best_model = None
@@ -130,17 +122,18 @@ for name, model in models.items():
 
 print(f"\nBest Model: {best_name} with Accuracy {best_accuracy:.4f}")
 
+print("\nClassification Report (Real-Time Attack Types):")
+y_pred_best = best_model.predict(X_test)
+print(classification_report(y_test, y_pred_best))
+
 # 4. Save Artifacts
-print("Saving best model, scaler, and label encoder...")
+print("Saving artifacts...")
 with open("best_model.pkl", "wb") as f:
     pickle.dump(best_model, f)
-
 with open("scaler.pkl", "wb") as f:
     pickle.dump(scaler, f)
-
 with open("label_encoder.pkl", "wb") as f:
     pickle.dump(encoder, f)
-
 with open("feature_names.txt", "w") as f:
     f.write(",".join(FEATURES))
 

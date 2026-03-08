@@ -1,180 +1,151 @@
+import sys
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import time
 import os
+import time
 import subprocess
-import signal
-from datetime import datetime
 
-st.set_page_config(page_title="NIDS Dashboard", layout="wide")
+st.set_page_config(page_title="NIDS Real-Time Dashboard", layout="wide")
 
-st.title("🛡️ Real-time Network Intrusion Detection System")
-st.markdown("This dashboard predicts malicious activity using Machine Learning (trained on CICIDS2017).")
+# Paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PREDICTIONS_FILE = os.path.join(BASE_DIR, 'live_predictions.csv')
+PCAP_DIR = os.path.join(BASE_DIR, 'captured_pcaps')
+STOP_FILE = os.path.join(BASE_DIR, '.stop_capture')
 
-DATA_FILE = "live_predictions.csv"
-CAPTURE_DIR = "captured_pcaps"
+if not os.path.exists(PCAP_DIR):
+    os.makedirs(PCAP_DIR)
 
-if not os.path.exists(CAPTURE_DIR):
-    os.makedirs(CAPTURE_DIR)
+st.title("🛡️ Network Intrusion Detection System")
+st.markdown("Monitoring live network traffic using Machine Learning (Trained on CICIDS2017)")
 
-# Initialize Session State Variables
+# Use st_autorefresh for idiomatic Streamlit auto-refreshing instead of blocking while True loop
+try:
+    from streamlit_autorefresh import st_autorefresh
+    # Refresh every 2 seconds
+    st_autorefresh(interval=2000, limit=None, key="data_refresh")
+except ImportError:
+    pass
+
+def load_data():
+    if os.path.exists(PREDICTIONS_FILE):
+        try:
+            df = pd.read_csv(PREDICTIONS_FILE)
+            if not df.empty:
+                # Deduplicate based on Flow ID to prevent dashboard metric inflation from live active flow updates
+                if 'Flow ID' in df.columns:
+                    df = df.drop_duplicates(subset=['Flow ID'], keep='last')
+                return df
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+df = load_data()
+
+# --- Sidebar Controls ---
+st.sidebar.header("Capture Controls")
+
 if 'capturing' not in st.session_state:
-    st.session_state.capturing = False
-if 'capture_pid' not in st.session_state:
-    st.session_state.capture_pid = None
-if 'current_pcap' not in st.session_state:
-    st.session_state.current_pcap = None
-
-# Sidebar Content
-st.sidebar.header("Live Packet Capture")
-st.sidebar.markdown("Use this to manually start/stop recording your network traffic into a PCAP file.")
-
-# Status Indicator
-if st.session_state.capturing:
-    st.sidebar.info("🔴 Status: **CAPTURING LIVE TRAFFIC...**")
-else:
-    st.sidebar.success("🟢 Status: **IDLE**")
-
-# Start / Stop Buttons
-col1, col2 = st.sidebar.columns(2)
-
-with col1:
-    if st.button("▶️ Start Extracting", disabled=st.session_state.capturing):
-        st.session_state.capturing = True
-
-        # Generate filename based on timestamp
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        st.session_state.current_pcap = os.path.join(CAPTURE_DIR, f"capture_{timestamp}.pcap")
-
-        # Start the background capture process
-        proc = subprocess.Popen(["python", "live_capture.py", st.session_state.current_pcap])
-        st.session_state.capture_pid = proc.pid
-
-        st.sidebar.success(f"Started capturing to {st.session_state.current_pcap}")
-        st.rerun()
-
-with col2:
-    if st.button("⏹️ Pause & Analyze", disabled=not st.session_state.capturing):
+    # Check if a live_capture process is currently running
+    try:
+        pid_check = subprocess.run(["pgrep", "-f", "live_capture.py"], capture_output=True, text=True)
+        st.session_state.capturing = bool(pid_check.stdout.strip())
+    except:
         st.session_state.capturing = False
 
-        # Send SIGTERM to smoothly stop the scapy sniffer and save the file
-        if st.session_state.capture_pid:
-            try:
-                os.kill(st.session_state.capture_pid, signal.SIGTERM)
-                st.sidebar.success("Capture stopped! Saving PCAP...")
-            except ProcessLookupError:
-                st.sidebar.error("Capture process already died.")
+if st.sidebar.button("▶️ Start Extracting"):
+    if not st.session_state.capturing:
+        if os.path.exists(STOP_FILE):
+            os.remove(STOP_FILE)
 
-        # Wait a brief moment for the file to be fully written
-        time.sleep(2)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        pcap_file = os.path.join(PCAP_DIR, f"capture_{timestamp}.pcap")
 
-        # If the file exists, analyze it instantly with our ML models
-        if st.session_state.current_pcap and os.path.exists(st.session_state.current_pcap):
-            st.sidebar.info("Analyzing PCAP data with ML Models...")
-            # We call our offline processor to parse the newly saved PCAP
-            result = subprocess.run(["python", "process_pcap.py", st.session_state.current_pcap, DATA_FILE], capture_output=True, text=True)
-
-            if result.returncode == 0:
-                st.sidebar.success("Analysis Complete! Data added to dashboard.")
-            else:
-                st.sidebar.warning(f"Error during analysis: {result.stderr}")
-        else:
-            st.sidebar.error("PCAP file was not found.")
-
-        st.session_state.capture_pid = None
+        # Start capture in background
+        subprocess.Popen([sys.executable, "live_capture.py", pcap_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        st.session_state.capturing = True
+        st.session_state.current_pcap = pcap_file
+        st.sidebar.success("Capture started!")
+        time.sleep(1)
         st.rerun()
 
-st.sidebar.markdown("---")
-st.sidebar.header("Upload PCAP File")
-uploaded_file = st.sidebar.file_uploader("Upload a .pcap file", type=["pcap"])
+if st.sidebar.button("⏸️ Pause & Analyze"):
+    if st.session_state.capturing:
+        with open(STOP_FILE, "w") as f:
+            f.write("stop")
 
-if uploaded_file is not None:
-    temp_pcap = "temp_uploaded.pcap"
-    with open(temp_pcap, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+        with st.spinner("Stopping capture and analyzing PCAP..."):
+            time.sleep(3) # Give it time to flush and save the PCAP
+            st.session_state.capturing = False
 
-    st.sidebar.success("File uploaded successfully! Processing...")
-    try:
-        result = subprocess.run(["python", "process_pcap.py", temp_pcap, DATA_FILE], capture_output=True, text=True)
-        if result.returncode == 0:
-            st.sidebar.success("PCAP processed and added to the dashboard!")
-        else:
-            st.sidebar.error(f"Error processing PCAP: {result.stderr}")
-    except Exception as e:
-        st.sidebar.error(f"Execution failed: {e}")
-    if os.path.exists(temp_pcap):
-        os.remove(temp_pcap)
-
-# Main Dashboard Layout
-placeholder = st.empty()
-
-while True:
-    if not os.path.exists(DATA_FILE):
-        with placeholder.container():
-            st.warning(f"Waiting for {DATA_FILE} to be generated...")
-        time.sleep(2)
-        continue
-
-    try:
-        df = pd.read_csv(DATA_FILE)
-    except Exception as e:
-        time.sleep(1)
-        continue
-
-    if df.empty:
-        with placeholder.container():
-            st.warning("No network flows captured yet...")
-        time.sleep(2)
-        continue
-
-    total_flows = len(df)
-    threats_df = df[df['Prediction'] != 'BENIGN']
-    total_threats = len(threats_df)
-    attack_rate = (total_threats / total_flows) * 100 if total_flows > 0 else 0
-
-    with placeholder.container():
-        # Metrics
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Flows Analyzed", total_flows)
-        col2.metric("Threats Detected", total_threats, f"{attack_rate:.1f}% of traffic", delta_color="inverse")
-        col3.metric("Clean Traffic", total_flows - total_threats)
-
-        st.markdown("---")
-
-        # Visualizations
-        viz_col1, viz_col2 = st.columns([1, 1])
-
-        with viz_col1:
-            st.subheader("Traffic Distribution (Pie Chart)")
-            pie_data = df['Prediction'].value_counts().reset_index()
-            pie_data.columns = ['Attack Type', 'Count']
-
-            fig = px.pie(
-                pie_data,
-                values='Count',
-                names='Attack Type',
-                title='Network Threat Types Detected',
-                hole=0.4,
-                color='Attack Type',
-                color_discrete_map={'BENIGN': 'lightgreen'}
-            )
-            fig.update_traces(textposition='inside', textinfo='percent+label')
-            st.plotly_chart(fig, use_container_width=True)
-
-        with viz_col2:
-            st.subheader("Recent Flagged Threats 🚨")
-            if not threats_df.empty:
-                recent_threats = threats_df.tail(10).sort_values(by='Timestamp', ascending=False)
-                st.dataframe(
-                    recent_threats.style.applymap(lambda x: 'background-color: #ffcccc' if x != 'BENIGN' else '', subset=['Prediction']),
-                    use_container_width=True,
-                    hide_index=True
-                )
+            pcap_file = st.session_state.get('current_pcap')
+            if pcap_file and os.path.exists(pcap_file):
+                # Analyze it
+                subprocess.run([sys.executable, "process_pcap.py", pcap_file, PREDICTIONS_FILE])
+                st.sidebar.success("Analysis complete!")
             else:
-                st.success("No threats detected yet!")
+                st.sidebar.error("PCAP file not found or empty.")
+            time.sleep(1)
+            st.rerun()
 
-        st.subheader("All Live Network Flows")
-        st.dataframe(df.tail(20).sort_values(by='Timestamp', ascending=False), use_container_width=True, hide_index=True)
+if st.session_state.capturing:
+    st.sidebar.info("🔴 Live Capture is RUNNING")
+else:
+    st.sidebar.info("⚫ Capture is PAUSED")
 
-    time.sleep(3)
+st.sidebar.markdown("---")
+if st.sidebar.button("🗑️ Clear Dashboard Data"):
+    if os.path.exists(PREDICTIONS_FILE):
+        os.remove(PREDICTIONS_FILE)
+    st.rerun()
+
+# --- Main Dashboard ---
+if df.empty:
+    st.warning("No data found. Click 'Start Extracting' in the sidebar or run `python network_monitor.py`.")
+else:
+    # 1. Top Metrics
+    total_flows = len(df)
+
+    # Calculate attacks (anything not BENIGN)
+    attacks_df = df[df['Prediction'] != 'BENIGN']
+    total_attacks = len(attacks_df)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Flows Analyzed", total_flows)
+    col2.metric("Total Attacks Detected", total_attacks, delta_color="inverse")
+
+    latest_attack = attacks_df.iloc[-1]['Prediction'] if total_attacks > 0 else "None"
+    col3.metric("Latest Threat", latest_attack)
+
+    st.markdown("---")
+
+    # 2. Charts Row
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.subheader("Traffic Distribution")
+        class_counts = df['Prediction'].value_counts().reset_index()
+        class_counts.columns = ['Prediction', 'Count']
+        fig_pie = px.pie(class_counts, names='Prediction', values='Count', hole=0.4,
+                         color_discrete_sequence=px.colors.qualitative.Pastel)
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    with c2:
+        st.subheader("Recent Alerts (Attacks)")
+        if total_attacks > 0:
+            # Show last 10 attacks
+            recent_attacks = attacks_df.tail(10)[::-1]
+            st.dataframe(recent_attacks[['Timestamp', 'Source IP', 'Dest IP', 'Protocol', 'Prediction', 'Probability']],
+                         use_container_width=True)
+        else:
+            st.success("No attacks detected recently! System is secure.")
+
+    # 3. Full Data View
+    st.subheader("Live Traffic Feed")
+    st.dataframe(df.tail(20)[::-1], use_container_width=True)
+
+# Manual fallback for refresh
+if "st_autorefresh" not in sys.modules:
+    time.sleep(2)
+    st.rerun()

@@ -2,25 +2,89 @@ import sys
 import os
 import pickle
 import pandas as pd
-from scapy.all import rdpcap, IP, TCP
+from scapy.all import rdpcap, IP, TCP, UDP
 from datetime import datetime
 import warnings
 
 warnings.filterwarnings('ignore')
 
-# Load the trained model and preprocessing tools
+# We load the files assuming they are in the same directory as process_pcap.py
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 try:
-    with open('best_model.pkl', 'rb') as f:
+    with open(os.path.join(BASE_DIR, 'best_model.pkl'), 'rb') as f:
         model = pickle.load(f)
-    with open('scaler.pkl', 'rb') as f:
+    with open(os.path.join(BASE_DIR, 'scaler.pkl'), 'rb') as f:
         scaler = pickle.load(f)
-    with open('label_encoder.pkl', 'rb') as f:
+    with open(os.path.join(BASE_DIR, 'label_encoder.pkl'), 'rb') as f:
         encoder = pickle.load(f)
-    with open('feature_names.txt', 'r') as f:
+    with open(os.path.join(BASE_DIR, 'feature_names.txt'), 'r') as f:
         FEATURES = f.read().split(',')
-except FileNotFoundError:
-    print("Model files not found. Please run train_models.py first.")
+except FileNotFoundError as e:
+    print(f"Model files not found. Error: {e}")
     sys.exit(1)
+
+def extract_features_from_flow(flow):
+    duration_sec = max(flow['last_time'] - flow['start_time'], 0.000001) # Minimum 1us to avoid division by zero
+    flow_duration_us = duration_sec * 1e6 # microseconds
+
+    total_packets = flow['fwd_packets'] + flow['bwd_packets']
+    total_bytes = flow['fwd_length'] + flow['bwd_length']
+
+    features = [
+        flow_duration_us,
+        flow['fwd_packets'],
+        flow['bwd_packets'],
+        flow['fwd_length'],
+        flow['bwd_length'],
+        flow['fwd_max'],
+        flow['fwd_min'],
+        flow['bwd_max'],
+        flow['bwd_min'],
+        (total_bytes / duration_sec),   # Flow Bytes/s
+        (total_packets / duration_sec), # Flow Packets/s
+        flow['fin_flag'],
+        flow['syn_flag'],
+        flow['rst_flag'],
+        flow['psh_flag'],
+        flow['ack_flag']
+    ]
+    return features
+
+def predict_flows(flows_dict):
+    results = []
+
+    if not flows_dict:
+        return results
+
+    features_list = []
+    keys_list = []
+
+    for key, flow in flows_dict.items():
+        feats = extract_features_from_flow(flow)
+        features_list.append(feats)
+        keys_list.append((key, flow['last_time']))
+
+    feature_df = pd.DataFrame(features_list, columns=FEATURES)
+    scaled_features = scaler.transform(feature_df)
+
+    # Predict all at once for speed
+    predictions_idx = model.predict(scaled_features)
+    probabilities = model.predict_proba(scaled_features).max(axis=1)
+    predictions = encoder.inverse_transform(predictions_idx)
+
+    for i, (key, last_time) in enumerate(keys_list):
+        dt_time = datetime.fromtimestamp(last_time).strftime('%Y-%m-%d %H:%M:%S')
+        results.append({
+            'Timestamp': dt_time,
+            'Source IP': key[0],
+            'Dest IP': key[2],
+            'Protocol': key[4],
+            'Prediction': predictions[i],
+            'Probability': f"{probabilities[i]:.4f}"
+        })
+
+    return results
 
 def process_pcap_file(pcap_path, output_csv):
     print(f"Loading {pcap_path} for offline processing...")
@@ -35,12 +99,26 @@ def process_pcap_file(pcap_path, output_csv):
     print(f"Loaded {len(packets)} packets. Analyzing flows...")
 
     for pkt in packets:
-        if IP in pkt and TCP in pkt:
+        if IP in pkt and (TCP in pkt or UDP in pkt):
             src_ip = pkt[IP].src
             dst_ip = pkt[IP].dst
-            src_port = pkt[TCP].sport
-            dst_port = pkt[TCP].dport
-            proto = "TCP"
+
+            # Extract ports and protocol
+            if TCP in pkt:
+                src_port = pkt[TCP].sport
+                dst_port = pkt[TCP].dport
+                proto = "TCP"
+                # Extract flags if TCP
+                fin = pkt[TCP].flags.F
+                syn = pkt[TCP].flags.S
+                rst = pkt[TCP].flags.R
+                psh = pkt[TCP].flags.P
+                ack = pkt[TCP].flags.A
+            else: # UDP
+                src_port = pkt[UDP].sport
+                dst_port = pkt[UDP].dport
+                proto = "UDP"
+                fin = syn = rst = psh = ack = 0
 
             flow_key = (src_ip, src_port, dst_ip, dst_port, proto)
             rev_flow_key = (dst_ip, dst_port, src_ip, src_port, proto)
@@ -61,11 +139,11 @@ def process_pcap_file(pcap_path, output_csv):
                     'fwd_min': length,
                     'bwd_max': 0,
                     'bwd_min': 0,
-                    'fin_flag': pkt[TCP].flags.F,
-                    'syn_flag': pkt[TCP].flags.S,
-                    'rst_flag': pkt[TCP].flags.R,
-                    'psh_flag': pkt[TCP].flags.P,
-                    'ack_flag': pkt[TCP].flags.A
+                    'fin_flag': fin,
+                    'syn_flag': syn,
+                    'rst_flag': rst,
+                    'psh_flag': psh,
+                    'ack_flag': ack
                 }
             elif flow_key in active_flows:
                 flow = active_flows[flow_key]
@@ -74,8 +152,11 @@ def process_pcap_file(pcap_path, output_csv):
                 flow['fwd_max'] = max(flow['fwd_max'], length)
                 flow['fwd_min'] = min(flow['fwd_min'], length)
                 flow['last_time'] = timestamp
-                flow['fin_flag'] = max(flow['fin_flag'], pkt[TCP].flags.F)
-                flow['syn_flag'] = max(flow['syn_flag'], pkt[TCP].flags.S)
+                flow['fin_flag'] = max(flow['fin_flag'], fin)
+                flow['syn_flag'] = max(flow['syn_flag'], syn)
+                flow['rst_flag'] = max(flow['rst_flag'], rst)
+                flow['psh_flag'] = max(flow['psh_flag'], psh)
+                flow['ack_flag'] = max(flow['ack_flag'], ack)
             elif rev_flow_key in active_flows:
                 flow = active_flows[rev_flow_key]
                 flow['bwd_packets'] += 1
@@ -88,50 +169,7 @@ def process_pcap_file(pcap_path, output_csv):
                     flow['bwd_min'] = min(flow['bwd_min'], length)
                 flow['last_time'] = timestamp
 
-    results = []
-
-    for key, flow in active_flows.items():
-        duration = flow['last_time'] - flow['start_time']
-        flow_duration = duration * 1e6 # microseconds
-        total_packets = flow['fwd_packets'] + flow['bwd_packets']
-        total_bytes = flow['fwd_length'] + flow['bwd_length']
-
-        features = [
-            flow_duration,
-            flow['fwd_packets'],
-            flow['bwd_packets'],
-            flow['fwd_length'],
-            flow['bwd_length'],
-            flow['fwd_max'],
-            flow['fwd_min'],
-            flow['bwd_max'],
-            flow['bwd_min'],
-            (total_bytes / duration) if duration > 0 else 0,
-            (total_packets / duration) if duration > 0 else 0,
-            flow['fin_flag'],
-            flow['syn_flag'],
-            flow['rst_flag'],
-            flow['psh_flag'],
-            flow['ack_flag']
-        ]
-
-        feature_df = pd.DataFrame([features], columns=FEATURES)
-        scaled_features = scaler.transform(feature_df)
-
-        pred_idx = model.predict(scaled_features)[0]
-        prob = max(model.predict_proba(scaled_features)[0])
-        prediction = encoder.inverse_transform([pred_idx])[0]
-
-        dt_time = datetime.fromtimestamp(flow['last_time']).strftime('%Y-%m-%d %H:%M:%S')
-
-        results.append({
-            'Timestamp': dt_time,
-            'Source IP': key[0],
-            'Dest IP': key[2],
-            'Protocol': key[4],
-            'Prediction': prediction,
-            'Probability': f"{prob:.2f}"
-        })
+    results = predict_flows(active_flows)
 
     if results:
         df = pd.DataFrame(results)
@@ -143,7 +181,7 @@ def process_pcap_file(pcap_path, output_csv):
 
         print(f"Successfully processed {len(results)} flows and saved to {output_csv}.")
     else:
-        print("No TCP flows found in the PCAP file.")
+        print("No TCP/UDP flows found in the PCAP file.")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -152,4 +190,9 @@ if __name__ == "__main__":
 
     pcap = sys.argv[1]
     out_csv = sys.argv[2] if len(sys.argv) > 2 else 'live_predictions.csv'
+
+    # Make sure output path is relative to the script directory if it's just a filename
+    if not os.path.isabs(out_csv) and os.path.dirname(out_csv) == '':
+        out_csv = os.path.join(BASE_DIR, out_csv)
+
     process_pcap_file(pcap, out_csv)

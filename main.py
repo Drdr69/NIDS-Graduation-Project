@@ -8,10 +8,20 @@ def start_services():
 
     if os.path.exists("live_predictions.csv"):
         print("Clearing old live_predictions.csv...")
-        os.remove("live_predictions.csv")
+        try:
+            os.remove("live_predictions.csv")
+        except:
+            pass
+
+    # Clean up any leftover stop flags
+    if os.path.exists(".stop_capture"):
+        try:
+            os.remove(".stop_capture")
+        except:
+            pass
 
     # Start Network Monitor Background Process
-    monitor_process = subprocess.Popen(["python", "network_monitor.py"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    monitor_process = subprocess.Popen([sys.executable, "network_monitor.py"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     print(f"Network monitor started (PID: {monitor_process.pid})")
 
     # Start Streamlit Dashboard
@@ -31,7 +41,12 @@ def start_services():
                 print(f"Error: Dashboard crashed with code {dashboard_process.returncode}")
                 break
     except KeyboardInterrupt:
-        print("\nStopping all services...")
+        print("\nStopping all services gracefully...")
+        # Create stop file for graceful exit in Windows
+        with open(".stop_capture", "w") as f:
+            f.write("stop")
+
+        time.sleep(2) # Give them a second to notice and shutdown
         monitor_process.terminate()
         dashboard_process.terminate()
         print("Services stopped.")
