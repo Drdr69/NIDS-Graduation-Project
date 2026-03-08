@@ -39,32 +39,54 @@ def generate_mock_data(n_samples=5000):
     for feature in FEATURES:
         # Generate some semi-realistic numbers
         if 'Flag' in feature:
-            data[feature] = np.random.randint(0, 2, n_samples)
+            data[feature] = np.zeros(n_samples) # Mostly benign, no flags
         elif 'Duration' in feature:
-            data[feature] = np.random.exponential(100000, n_samples)
+            data[feature] = np.random.exponential(500, n_samples)
         elif 'Length' in feature:
-            data[feature] = np.random.randint(0, 1500, n_samples)
+            data[feature] = np.random.normal(100, 20, n_samples)
         else:
-            data[feature] = np.random.rand(n_samples) * 100
+            data[feature] = np.random.rand(n_samples) * 10
 
     df = pd.DataFrame(data)
 
-    # Assign labels (Simulating CICIDS2017 classes)
+    # Mostly benign
     labels = np.random.choice(
         ['BENIGN', 'DoS Hulk', 'PortScan', 'DDoS', 'Bot', 'FTP-Patator', 'SSH-Patator', 'Web Attack - Brute Force'],
         n_samples,
-        p=[0.6, 0.1, 0.1, 0.05, 0.05, 0.05, 0.03, 0.02]
+        p=[0.9, 0.02, 0.02, 0.02, 0.01, 0.01, 0.01, 0.01]
     )
     df['Label'] = labels
 
-    # Introduce some correlations to make models actually learn something
-    df.loc[df['Label'] == 'PortScan', 'SYN Flag Count'] = 1
-    df.loc[df['Label'] == 'DoS Hulk', 'Flow Packets/s'] = df.loc[df['Label'] == 'DoS Hulk', 'Flow Packets/s'] * 10
+    # Introduce explicit, very strong patterns so the model learns them flawlessly and doesn't hallucinate
+
+    # Benign: small packets, few flags
+    benign_idx = df['Label'] == 'BENIGN'
+    df.loc[benign_idx, 'Flow Bytes/s'] = np.random.uniform(10, 500, sum(benign_idx))
+    df.loc[benign_idx, 'Flow Packets/s'] = np.random.uniform(1, 50, sum(benign_idx))
+
+    # PortScan: Lots of SYN flags, small packets, high packet rate
+    portscan_idx = df['Label'] == 'PortScan'
+    df.loc[portscan_idx, 'SYN Flag Count'] = 1
+    df.loc[portscan_idx, 'Flow Packets/s'] = np.random.uniform(5000, 20000, sum(portscan_idx))
+    df.loc[portscan_idx, 'Flow Duration'] = np.random.uniform(1, 10, sum(portscan_idx))
+
+    # DoS Hulk/DDoS: Huge packet rate, large flows
+    dos_idx = df['Label'].isin(['DoS Hulk', 'DDoS'])
+    df.loc[dos_idx, 'Flow Packets/s'] = np.random.uniform(50000, 200000, sum(dos_idx))
+    df.loc[dos_idx, 'Total Length of Fwd Packets'] = np.random.uniform(10000, 50000, sum(dos_idx))
+
+    # Web Attack: Large payloads
+    web_idx = df['Label'] == 'Web Attack - Brute Force'
+    df.loc[web_idx, 'Fwd Packet Length Max'] = np.random.uniform(2000, 5000, sum(web_idx))
+
+    # Bot/Patator: Long durations, periodic
+    bot_idx = df['Label'].isin(['Bot', 'FTP-Patator', 'SSH-Patator'])
+    df.loc[bot_idx, 'Flow Duration'] = np.random.uniform(500000, 1000000, sum(bot_idx))
 
     return df
 
-print("Generating mock dataset...")
-df = generate_mock_data()
+print("Generating better synthetic dataset...")
+df = generate_mock_data(n_samples=20000)
 df.to_csv("cicids2017_sample.csv", index=False)
 print("Saved sample dataset to cicids2017_sample.csv")
 
@@ -84,7 +106,7 @@ X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_encoded, test_si
 
 # 3. Train Models
 models = {
-    "Random Forest": RandomForestClassifier(n_estimators=50, random_state=42),
+    "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
     "XGBoost": xgb.XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=42),
     "KNN": KNeighborsClassifier(n_neighbors=5)
 }
