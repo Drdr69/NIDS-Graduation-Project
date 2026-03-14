@@ -31,7 +31,7 @@ OUTPUT_FILE = os.path.join(BASE_DIR, 'live_predictions.csv')
 
 def init_csv():
     if not os.path.exists(OUTPUT_FILE):
-        df = pd.DataFrame(columns=['Flow ID', 'Timestamp', 'Source IP', 'Dest IP', 'Protocol', 'Prediction', 'Probability'])
+        df = pd.DataFrame(columns=['Flow ID', 'Timestamp', 'Source IP', 'Dest IP', 'Protocol', 'Total Packets', 'Prediction', 'Probability'])
         df.to_csv(OUTPUT_FILE, index=False)
 
 # Real-time state tracking
@@ -198,6 +198,7 @@ def analyze_active_flows():
                         'Source IP': key[0],
                         'Dest IP': key[2],
                         'Protocol': key[4],
+                        'Total Packets': flow['fwd_packets'] + flow['bwd_packets'],
                         'Prediction': prediction,
                         'Probability': f"{prob:.4f}"
                     }

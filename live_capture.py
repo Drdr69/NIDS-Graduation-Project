@@ -2,11 +2,13 @@ import sys
 import time
 import os
 import signal
-from scapy.all import sniff, wrpcap, IP, TCP, UDP
+from scapy.all import sniff, IP, TCP, UDP
+from scapy.utils import PcapWriter
 
-packets_list = []
 capturing = True
 STOP_FILE = ".stop_capture"
+pcap_writer = None
+packets_captured = 0
 
 def signal_handler(sig, frame):
     global capturing
@@ -23,7 +25,7 @@ except AttributeError:
 def check_stop_file():
     global capturing
     if os.path.exists(STOP_FILE):
-        print("\n[Capture] Stop file detected. Saving packets...")
+        print("\n[Capture] Stop file detected. Stopping capture...")
         capturing = False
         try:
             os.remove(STOP_FILE)
@@ -33,11 +35,14 @@ def check_stop_file():
     return False
 
 def packet_callback(packet):
+    global packets_captured, pcap_writer
     if IP in packet and (TCP in packet or UDP in packet):
-        packets_list.append(packet)
+        if pcap_writer:
+            pcap_writer.write(packet)
+            packets_captured += 1
 
 def start_capture(output_file, duration=None, interface=None):
-    global capturing
+    global capturing, pcap_writer, packets_captured
     print(f"[Capture] Starting live network capture to {output_file}...")
     start_time = time.time()
 
@@ -48,7 +53,9 @@ def start_capture(output_file, duration=None, interface=None):
         except OSError:
             pass
 
-    # Check if we have root privileges (required for real sniffing on Linux/Mac, not always needed on Windows depending on npcap/winpcap)
+    # Open PcapWriter for streaming to disk to prevent Memory Leak on high-throughput attacks like hping3
+    pcap_writer = PcapWriter(output_file, append=True, sync=True)
+
     is_admin = False
     try:
         is_admin = os.getuid() == 0
@@ -60,38 +67,31 @@ def start_capture(output_file, duration=None, interface=None):
         except:
             is_admin = False
 
-    if is_admin:
-        try:
+    try:
+        if is_admin:
             while capturing:
                 if check_stop_file():
                     break
                 sniff(prn=packet_callback, store=False, filter="tcp or udp", timeout=1, iface=interface)
                 if duration and (time.time() - start_time) > float(duration):
                     break
-        except Exception as e:
-            print(f"[Capture Error] Sniffing failed: {e}")
-    else:
-        print("[Capture Warning] Not running as Administrator/Root! Capture may fail or only see local packets.")
-        try:
+        else:
+            print("[Capture Warning] Not running as Administrator/Root! Capture may fail or only see local packets.")
             while capturing:
                 if check_stop_file():
                     break
                 sniff(prn=packet_callback, store=False, filter="tcp or udp", timeout=1, iface=interface)
                 if duration and (time.time() - start_time) > float(duration):
                     break
-        except PermissionError:
-            print("[Capture Error] Permission denied! You must run as Administrator to capture real network packets.")
-        except Exception as e:
-            print(f"[Capture Error] Sniffing failed: {e}")
+    except PermissionError:
+        print("[Capture Error] Permission denied! You must run as Administrator to capture real network packets.")
+    except Exception as e:
+        print(f"[Capture Error] Sniffing failed: {e}")
+    finally:
+        if pcap_writer:
+            pcap_writer.close()
 
-    print(f"[Capture] Stopped. Saving {len(packets_list)} packets to {output_file}...")
-
-    if len(packets_list) > 0:
-        wrpcap(output_file, packets_list)
-        print(f"[Capture] Successfully saved {output_file}.")
-    else:
-        print("[Capture] No packets captured! Creating empty pcap.")
-        open(output_file, 'w').close()
+    print(f"[Capture] Stopped. Successfully streamed {packets_captured} packets to {output_file}.")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

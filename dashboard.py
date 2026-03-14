@@ -20,10 +20,8 @@ if not os.path.exists(PCAP_DIR):
 st.title("🛡️ Network Intrusion Detection System")
 st.markdown("Monitoring live network traffic using Machine Learning (Trained on CICIDS2017)")
 
-# Use st_autorefresh for idiomatic Streamlit auto-refreshing instead of blocking while True loop
 try:
     from streamlit_autorefresh import st_autorefresh
-    # Refresh every 2 seconds
     st_autorefresh(interval=2000, limit=None, key="data_refresh")
 except ImportError:
     pass
@@ -36,6 +34,8 @@ def load_data():
                 # Deduplicate based on Flow ID to prevent dashboard metric inflation from live active flow updates
                 if 'Flow ID' in df.columns:
                     df = df.drop_duplicates(subset=['Flow ID'], keep='last')
+                # Ensure Timestamp is datetime for time-series plotting
+                df['Timestamp'] = pd.to_datetime(df['Timestamp'])
                 return df
         except Exception:
             pass
@@ -47,7 +47,6 @@ df = load_data()
 st.sidebar.header("Capture Controls")
 
 if 'capturing' not in st.session_state:
-    # Check if a live_capture process is currently running
     try:
         pid_check = subprocess.run(["pgrep", "-f", "live_capture.py"], capture_output=True, text=True)
         st.session_state.capturing = bool(pid_check.stdout.strip())
@@ -62,7 +61,6 @@ if st.sidebar.button("▶️ Start Extracting"):
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         pcap_file = os.path.join(PCAP_DIR, f"capture_{timestamp}.pcap")
 
-        # Start capture in background
         subprocess.Popen([sys.executable, "live_capture.py", pcap_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         st.session_state.capturing = True
         st.session_state.current_pcap = pcap_file
@@ -76,12 +74,11 @@ if st.sidebar.button("⏸️ Pause & Analyze"):
             f.write("stop")
 
         with st.spinner("Stopping capture and analyzing PCAP..."):
-            time.sleep(3) # Give it time to flush and save the PCAP
+            time.sleep(3)
             st.session_state.capturing = False
 
             pcap_file = st.session_state.get('current_pcap')
             if pcap_file and os.path.exists(pcap_file):
-                # Analyze it
                 subprocess.run([sys.executable, "process_pcap.py", pcap_file, PREDICTIONS_FILE])
                 st.sidebar.success("Analysis complete!")
             else:
@@ -107,45 +104,70 @@ else:
     # 1. Top Metrics
     total_flows = len(df)
 
-    # Calculate attacks (anything not BENIGN)
+    # Add Total Packets column if missing (backward compatibility with old csvs)
+    if 'Total Packets' not in df.columns:
+        df['Total Packets'] = 1
+
+    total_packets_count = df['Total Packets'].sum()
     attacks_df = df[df['Prediction'] != 'BENIGN']
     total_attacks = len(attacks_df)
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Flows Analyzed", total_flows)
-    col2.metric("Total Attacks Detected", total_attacks, delta_color="inverse")
+    col2.metric("Total Packets", total_packets_count)
+    col3.metric("Total Attacks Detected", total_attacks, delta_color="inverse")
 
     latest_attack = attacks_df.iloc[-1]['Prediction'] if total_attacks > 0 else "None"
-    col3.metric("Latest Threat", latest_attack)
+    col4.metric("Latest Threat", latest_attack)
 
     st.markdown("---")
 
-    # 2. Charts Row
+    # 2. Danger Level Graph (Time Series)
+    st.subheader("Network Danger Level (Packets Over Time)")
+
+    # Create an aggregated timeseries of total packets per second
+    # Group into buckets (e.g., 2-second floors)
+    df['Time Window'] = df['Timestamp'].dt.floor('2S')
+    df['Type'] = df['Prediction'].apply(lambda x: 'Benign' if x == 'BENIGN' else 'Attack')
+
+    time_agg = df.groupby(['Time Window', 'Type'])['Total Packets'].sum().reset_index()
+
+    if not time_agg.empty:
+        fig_area = px.area(time_agg, x='Time Window', y='Total Packets', color='Type',
+                           color_discrete_map={'Benign': '#2ca02c', 'Attack': '#d62728'},
+                           labels={'Time Window': 'Time', 'Total Packets': 'Packet Volume'},
+                           title="Packet Volume categorized by Threat Level")
+        fig_area.update_layout(xaxis_title=None)
+        st.plotly_chart(fig_area, use_container_width=True)
+    else:
+        st.info("Waiting for enough time-series data to plot Danger Level...")
+
+    st.markdown("---")
+
+    # 3. Charts Row
     c1, c2 = st.columns(2)
 
     with c1:
-        st.subheader("Traffic Distribution")
+        st.subheader("Traffic Classification")
         class_counts = df['Prediction'].value_counts().reset_index()
         class_counts.columns = ['Prediction', 'Count']
         fig_pie = px.pie(class_counts, names='Prediction', values='Count', hole=0.4,
-                         color_discrete_sequence=px.colors.qualitative.Pastel)
+                         color_discrete_sequence=px.colors.qualitative.Set3)
         st.plotly_chart(fig_pie, use_container_width=True)
 
     with c2:
         st.subheader("Recent Alerts (Attacks)")
         if total_attacks > 0:
-            # Show last 10 attacks
             recent_attacks = attacks_df.tail(10)[::-1]
-            st.dataframe(recent_attacks[['Timestamp', 'Source IP', 'Dest IP', 'Protocol', 'Prediction', 'Probability']],
+            st.dataframe(recent_attacks[['Timestamp', 'Source IP', 'Dest IP', 'Protocol', 'Total Packets', 'Prediction', 'Probability']],
                          use_container_width=True)
         else:
             st.success("No attacks detected recently! System is secure.")
 
-    # 3. Full Data View
+    # 4. Full Data View
     st.subheader("Live Traffic Feed")
     st.dataframe(df.tail(20)[::-1], use_container_width=True)
 
-# Manual fallback for refresh
 if "st_autorefresh" not in sys.modules:
     time.sleep(2)
     st.rerun()

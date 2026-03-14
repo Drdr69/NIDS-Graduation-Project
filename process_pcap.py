@@ -1,4 +1,5 @@
 import sys
+import uuid
 import os
 import pickle
 import pandas as pd
@@ -77,9 +78,11 @@ def predict_flows(flows_dict):
         dt_time = datetime.fromtimestamp(last_time).strftime('%Y-%m-%d %H:%M:%S')
         results.append({
             'Timestamp': dt_time,
+            'Flow ID': str(uuid.uuid4())[:8],
             'Source IP': key[0],
             'Dest IP': key[2],
             'Protocol': key[4],
+            'Total Packets': flow['fwd_packets'] + flow['bwd_packets'],
             'Prediction': predictions[i],
             'Probability': f"{probabilities[i]:.4f}"
         })
