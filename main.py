@@ -4,36 +4,31 @@ import sys
 import os
 
 def start_services():
-    print("🚀 Starting NIDS Dashboard and Background Monitor...")
+    print("Starting NIDS Dashboard and Background Monitor...")
 
     if os.path.exists("live_predictions.csv"):
         print("Clearing old live_predictions.csv...")
         try:
             os.remove("live_predictions.csv")
-        except:
+        except Exception:
             pass
 
-    # Clean up any leftover stop flags
     if os.path.exists(".stop_capture"):
         try:
             os.remove(".stop_capture")
-        except:
+        except Exception:
             pass
 
-    # Start Network Monitor Background Process
-    monitor_process = subprocess.Popen([sys.executable, "network_monitor.py"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    monitor_process = subprocess.Popen([sys.executable, "network_monitor.py"], stdout=sys.stdout, stderr=sys.stderr)
     print(f"Network monitor started (PID: {monitor_process.pid})")
 
-    # Start Streamlit Dashboard
-    dashboard_process = subprocess.Popen(["streamlit", "run", "dashboard.py"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    dashboard_process = subprocess.Popen(["streamlit", "run", "dashboard.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f"Streamlit dashboard started (PID: {dashboard_process.pid})")
-    print("\n✅ Setup complete! Go to http://localhost:8501 in your browser to view the dashboard.\n")
+    print("\nSetup complete! Go to http://localhost:8501 in your browser to view the dashboard.\n")
 
     try:
-        # Keep launcher running until user stops it
         while True:
             time.sleep(1)
-            # Check if processes crashed
             if monitor_process.poll() is not None:
                 print(f"Error: Network monitor crashed with code {monitor_process.returncode}")
                 break
@@ -42,13 +37,17 @@ def start_services():
                 break
     except KeyboardInterrupt:
         print("\nStopping all services gracefully...")
-        # Create stop file for graceful exit in Windows
+    finally:
         with open(".stop_capture", "w") as f:
             f.write("stop")
 
-        time.sleep(2) # Give them a second to notice and shutdown
-        monitor_process.terminate()
-        dashboard_process.terminate()
+        time.sleep(1)
+
+        if monitor_process.poll() is None:
+            monitor_process.terminate()
+        if dashboard_process.poll() is None:
+            dashboard_process.terminate()
+
         print("Services stopped.")
 
 if __name__ == "__main__":

@@ -17,9 +17,7 @@ STOP_FILE = os.path.join(BASE_DIR, '.stop_capture')
 if not os.path.exists(PCAP_DIR):
     os.makedirs(PCAP_DIR)
 
-st.title("🛡️ Network Intrusion Detection System")
-st.markdown("Monitoring live network traffic using Machine Learning (Trained on CICIDS2017)")
-
+# Auto-refresh
 try:
     from streamlit_autorefresh import st_autorefresh
     st_autorefresh(interval=2000, limit=None, key="data_refresh")
@@ -43,11 +41,13 @@ def load_data():
 
 df = load_data()
 
-# --- Sidebar Controls ---
-st.sidebar.header("Capture Controls")
+# --- Sidebar UI Controls ---
+st.sidebar.header("🛡️ Capture Controls")
 
+# Determine active capture state securely
 if 'capturing' not in st.session_state:
     try:
+        # Check running processes
         pid_check = subprocess.run(["pgrep", "-f", "live_capture.py"], capture_output=True, text=True)
         st.session_state.capturing = bool(pid_check.stdout.strip())
     except:
@@ -61,6 +61,7 @@ if st.sidebar.button("▶️ Start Extracting"):
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         pcap_file = os.path.join(PCAP_DIR, f"capture_{timestamp}.pcap")
 
+        # Start capture in the background
         subprocess.Popen([sys.executable, "live_capture.py", pcap_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         st.session_state.capturing = True
         st.session_state.current_pcap = pcap_file
@@ -73,7 +74,7 @@ if st.sidebar.button("⏸️ Pause & Analyze"):
         with open(STOP_FILE, "w") as f:
             f.write("stop")
 
-        with st.spinner("Stopping capture and analyzing PCAP..."):
+        with st.spinner("Stopping capture and analyzing PCAP securely..."):
             time.sleep(3)
             st.session_state.capturing = False
 
@@ -92,81 +93,91 @@ else:
     st.sidebar.info("⚫ Capture is PAUSED")
 
 st.sidebar.markdown("---")
+st.sidebar.header("⚙️ View Settings")
+show_only_attacks = st.sidebar.checkbox("Show Only Attacks", value=False)
+min_prob = st.sidebar.slider("Minimum Prediction Confidence (%)", 0, 100, 50)
+
 if st.sidebar.button("🗑️ Clear Dashboard Data"):
     if os.path.exists(PREDICTIONS_FILE):
         os.remove(PREDICTIONS_FILE)
     st.rerun()
 
-# --- Main Dashboard ---
+# --- Main Dashboard Header ---
+st.title("Network Intrusion Detection System")
+st.markdown("Real-time monitoring and ML-based flow classification.")
+
+# --- Content Area ---
 if df.empty:
-    st.warning("No data found. Click 'Start Extracting' in the sidebar or run `python network_monitor.py`.")
+    st.warning("No network data found. Click **'Start Extracting'** in the sidebar or run `python network_monitor.py`.")
 else:
-    # 1. Top Metrics
-    total_flows = len(df)
+    # Filter based on user settings
+    df = df[df['Probability'] >= (min_prob / 100.0)]
+    if show_only_attacks:
+        df = df[df['Prediction'] != 'BENIGN']
 
-    # Add Total Packets column if missing (backward compatibility with old csvs)
-    if 'Total Packets' not in df.columns:
-        df['Total Packets'] = 1
-
-    total_packets_count = df['Total Packets'].sum()
-    attacks_df = df[df['Prediction'] != 'BENIGN']
-    total_attacks = len(attacks_df)
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total Flows Analyzed", total_flows)
-    col2.metric("Total Packets", total_packets_count)
-    col3.metric("Total Attacks Detected", total_attacks, delta_color="inverse")
-
-    latest_attack = attacks_df.iloc[-1]['Prediction'] if total_attacks > 0 else "None"
-    col4.metric("Latest Threat", latest_attack)
-
-    st.markdown("---")
-
-    # 2. Danger Level Graph (Time Series)
-    st.subheader("Network Danger Level (Packets Over Time)")
-
-    # Create an aggregated timeseries of total packets per second
-    # Group into buckets (e.g., 2-second floors)
-    df['Time Window'] = df['Timestamp'].dt.floor('2S')
-    df['Type'] = df['Prediction'].apply(lambda x: 'Benign' if x == 'BENIGN' else 'Attack')
-
-    time_agg = df.groupby(['Time Window', 'Type'])['Total Packets'].sum().reset_index()
-
-    if not time_agg.empty:
-        fig_area = px.area(time_agg, x='Time Window', y='Total Packets', color='Type',
-                           color_discrete_map={'Benign': '#2ca02c', 'Attack': '#d62728'},
-                           labels={'Time Window': 'Time', 'Total Packets': 'Packet Volume'},
-                           title="Packet Volume categorized by Threat Level")
-        fig_area.update_layout(xaxis_title=None)
-        st.plotly_chart(fig_area, use_container_width=True)
+    if df.empty:
+        st.info("No data matches current filter settings.")
     else:
-        st.info("Waiting for enough time-series data to plot Danger Level...")
+        # Calculate key metrics
+        total_flows = len(df)
+        if 'Total Packets' not in df.columns:
+            df['Total Packets'] = 1 # Backwards compatibility
 
-    st.markdown("---")
+        total_packets_count = df['Total Packets'].sum()
+        attacks_df = df[df['Prediction'] != 'BENIGN']
+        total_attacks = len(attacks_df)
 
-    # 3. Charts Row
-    c1, c2 = st.columns(2)
+        # 1. Metric Row
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Flows Analyzed", total_flows)
+        col2.metric("Total Packets Evaluated", total_packets_count)
+        col3.metric("Total Threats Detected", total_attacks, delta_color="inverse")
+        latest_attack = attacks_df.iloc[-1]['Prediction'] if total_attacks > 0 else "None"
+        col4.metric("Latest Threat Class", latest_attack)
 
-    with c1:
-        st.subheader("Traffic Classification")
-        class_counts = df['Prediction'].value_counts().reset_index()
-        class_counts.columns = ['Prediction', 'Count']
-        fig_pie = px.pie(class_counts, names='Prediction', values='Count', hole=0.4,
-                         color_discrete_sequence=px.colors.qualitative.Set3)
-        st.plotly_chart(fig_pie, use_container_width=True)
+        st.markdown("---")
 
-    with c2:
-        st.subheader("Recent Alerts (Attacks)")
-        if total_attacks > 0:
-            recent_attacks = attacks_df.tail(10)[::-1]
-            st.dataframe(recent_attacks[['Timestamp', 'Source IP', 'Dest IP', 'Protocol', 'Total Packets', 'Prediction', 'Probability']],
-                         use_container_width=True)
-        else:
-            st.success("No attacks detected recently! System is secure.")
+        # Tabs for better organization
+        tab1, tab2, tab3 = st.tabs(["📊 Live Activity", "📈 Flow Analytics", "🔍 Detailed Insights"])
 
-    # 4. Full Data View
-    st.subheader("Live Traffic Feed")
-    st.dataframe(df.tail(20)[::-1], use_container_width=True)
+        with tab1:
+            st.subheader("Network Danger Level (Packets Over Time)")
+            st.markdown("Observe spikes in network activity during downloads, video streaming, or DDoS attacks.")
+
+            # Floor by 2-seconds to aggregate packet counts securely
+            df['Time Window'] = df['Timestamp'].dt.floor('2S')
+            df['Threat Category'] = df['Prediction'].apply(lambda x: 'Benign' if x == 'BENIGN' else 'Attack')
+
+            time_agg = df.groupby(['Time Window', 'Threat Category'])['Total Packets'].sum().reset_index()
+
+            if not time_agg.empty:
+                fig_area = px.area(time_agg, x='Time Window', y='Total Packets', color='Threat Category',
+                                   color_discrete_map={'Benign': '#2ca02c', 'Attack': '#d62728'},
+                                   labels={'Time Window': 'Time', 'Total Packets': 'Packet Volume'},
+                                   title="Live Packet Volume categorized by Threat Level")
+                fig_area.update_layout(xaxis_title=None, hovermode="x unified")
+                st.plotly_chart(fig_area, use_container_width=True)
+            else:
+                st.info("Waiting for enough time-series data...")
+
+        with tab2:
+            st.subheader("Threat Classification Distribution")
+            class_counts = df['Prediction'].value_counts().reset_index()
+            class_counts.columns = ['Classification', 'Count']
+            fig_pie = px.pie(class_counts, names='Classification', values='Count', hole=0.4,
+                             color_discrete_sequence=px.colors.qualitative.Set3)
+            fig_pie.update_traces(textinfo='percent+label')
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        with tab3:
+            st.subheader("Detailed Flow Insights")
+            st.markdown("In-depth technical breakdown of recent active network connections.")
+
+            # Display detailed metrics added previously (if they exist)
+            display_cols = ['Timestamp', 'Source IP', 'Dest IP', 'Protocol', 'Total Packets', 'Total Bytes', 'Flow Duration (s)', 'Packets/s', 'Prediction', 'Probability']
+            available_cols = [col for col in display_cols if col in df.columns]
+
+            st.dataframe(df.tail(30)[::-1][available_cols], use_container_width=True)
 
 if "st_autorefresh" not in sys.modules:
     time.sleep(2)

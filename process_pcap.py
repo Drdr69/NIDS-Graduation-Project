@@ -1,15 +1,12 @@
 import sys
-import uuid
+import hashlib
 import os
 import pickle
 import pandas as pd
 from scapy.all import rdpcap, IP, TCP, UDP
 from datetime import datetime
-import warnings
 
-warnings.filterwarnings('ignore')
 
-# We load the files assuming they are in the same directory as process_pcap.py
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 try:
@@ -26,8 +23,8 @@ except FileNotFoundError as e:
     sys.exit(1)
 
 def extract_features_from_flow(flow):
-    duration_sec = max(flow['last_time'] - flow['start_time'], 0.000001) # Minimum 1us to avoid division by zero
-    flow_duration_us = duration_sec * 1e6 # microseconds
+    duration_sec = max(flow['last_time'] - flow['start_time'], 0.000001)
+    flow_duration_us = duration_sec * 1e6
 
     total_packets = flow['fwd_packets'] + flow['bwd_packets']
     total_bytes = flow['fwd_length'] + flow['bwd_length']
@@ -42,47 +39,60 @@ def extract_features_from_flow(flow):
         flow['fwd_min'],
         flow['bwd_max'],
         flow['bwd_min'],
-        (total_bytes / duration_sec),   # Flow Bytes/s
-        (total_packets / duration_sec), # Flow Packets/s
+        (total_bytes / duration_sec),
+        (total_packets / duration_sec),
         flow['fin_flag'],
         flow['syn_flag'],
         flow['rst_flag'],
         flow['psh_flag'],
         flow['ack_flag']
     ]
-    return features
+    return features, duration_sec, total_packets, total_bytes
 
 def predict_flows(flows_dict):
     results = []
-
     if not flows_dict:
         return results
 
     features_list = []
     keys_list = []
+    meta_list = []
 
     for key, flow in flows_dict.items():
-        feats = extract_features_from_flow(flow)
+        feats, duration_sec, total_packets, total_bytes = extract_features_from_flow(flow)
         features_list.append(feats)
         keys_list.append((key, flow['last_time']))
+        meta_list.append((duration_sec, total_packets, total_bytes))
 
     feature_df = pd.DataFrame(features_list, columns=FEATURES)
     scaled_features = scaler.transform(feature_df)
 
-    # Predict all at once for speed
     predictions_idx = model.predict(scaled_features)
     probabilities = model.predict_proba(scaled_features).max(axis=1)
     predictions = encoder.inverse_transform(predictions_idx)
 
     for i, (key, last_time) in enumerate(keys_list):
         dt_time = datetime.fromtimestamp(last_time).strftime('%Y-%m-%d %H:%M:%S')
+        duration_sec, total_packets, total_bytes = meta_list[i]
+
+        bytes_per_s = total_bytes / duration_sec
+        packets_per_s = total_packets / duration_sec
+
+        src_ip, src_port, dst_ip, dst_port, proto = key
+        flow_id_str = f"{min(src_ip, dst_ip)}-{max(src_ip, dst_ip)}-{min(src_port, dst_port)}-{max(src_port, dst_port)}-{proto}"
+        flow_id = hashlib.md5(flow_id_str.encode()).hexdigest()[:8]
+
         results.append({
+            'Flow ID': flow_id,
             'Timestamp': dt_time,
-            'Flow ID': str(uuid.uuid4())[:8],
-            'Source IP': key[0],
-            'Dest IP': key[2],
-            'Protocol': key[4],
-            'Total Packets': flow['fwd_packets'] + flow['bwd_packets'],
+            'Source IP': src_ip,
+            'Dest IP': dst_ip,
+            'Protocol': proto,
+            'Total Packets': total_packets,
+            'Total Bytes': total_bytes,
+            'Flow Duration (s)': f"{duration_sec:.2f}",
+            'Packets/s': f"{packets_per_s:.2f}",
+            'Bytes/s': f"{bytes_per_s:.2f}",
             'Prediction': predictions[i],
             'Probability': f"{probabilities[i]:.4f}"
         })
@@ -106,18 +116,16 @@ def process_pcap_file(pcap_path, output_csv):
             src_ip = pkt[IP].src
             dst_ip = pkt[IP].dst
 
-            # Extract ports and protocol
             if TCP in pkt:
                 src_port = pkt[TCP].sport
                 dst_port = pkt[TCP].dport
                 proto = "TCP"
-                # Extract flags if TCP
                 fin = pkt[TCP].flags.F
                 syn = pkt[TCP].flags.S
                 rst = pkt[TCP].flags.R
                 psh = pkt[TCP].flags.P
                 ack = pkt[TCP].flags.A
-            else: # UDP
+            else:
                 src_port = pkt[UDP].sport
                 dst_port = pkt[UDP].dport
                 proto = "UDP"
@@ -126,7 +134,6 @@ def process_pcap_file(pcap_path, output_csv):
             flow_key = (src_ip, src_port, dst_ip, dst_port, proto)
             rev_flow_key = (dst_ip, dst_port, src_ip, src_port, proto)
 
-            # Scapy time is a float timestamp
             timestamp = float(pkt.time)
             length = len(pkt)
 
@@ -176,7 +183,6 @@ def process_pcap_file(pcap_path, output_csv):
 
     if results:
         df = pd.DataFrame(results)
-        # If the file doesn't exist, create it with headers, otherwise append without headers
         if not os.path.exists(output_csv):
             df.to_csv(output_csv, index=False)
         else:
@@ -194,7 +200,6 @@ if __name__ == "__main__":
     pcap = sys.argv[1]
     out_csv = sys.argv[2] if len(sys.argv) > 2 else 'live_predictions.csv'
 
-    # Make sure output path is relative to the script directory if it's just a filename
     if not os.path.isabs(out_csv) and os.path.dirname(out_csv) == '':
         out_csv = os.path.join(BASE_DIR, out_csv)
 

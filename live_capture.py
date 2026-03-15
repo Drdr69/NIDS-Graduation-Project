@@ -53,7 +53,6 @@ def start_capture(output_file, duration=None, interface=None):
         except OSError:
             pass
 
-    # Open PcapWriter for streaming to disk to prevent Memory Leak on high-throughput attacks like hping3
     pcap_writer = PcapWriter(output_file, append=True, sync=True)
 
     is_admin = False

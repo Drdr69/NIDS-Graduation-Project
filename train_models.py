@@ -12,16 +12,39 @@ import os
 print("Starting model training process...")
 
 # 1. Load Real CICIDS2017 Dataset Sample
-if not os.path.exists("cicids2017_real_sample.csv"):
-    print("Error: real sample not found.")
-    exit(1)
+dataset_file = "cicids2017_real_sample.csv"
 
-df = pd.read_csv("cicids2017_real_sample.csv")
+if not os.path.exists(dataset_file):
+    print("Warning: Real dataset not found locally. Attempting to download from Hugging Face...")
+    try:
+        from datasets import load_dataset
+        dataset = load_dataset('bvk/CICIDS-2017', split='train')
+        df = dataset.to_pandas()
+
+        attacks = df[df['Label'] != 'BENIGN']
+        benign = df[df['Label'] == 'BENIGN']
+
+        if len(benign) > 100000:
+            benign_sample = benign.sample(n=100000, random_state=42)
+        else:
+            benign_sample = benign
+
+        df_balanced = pd.concat([benign_sample, attacks])
+        df_balanced = df_balanced.sample(frac=1, random_state=42).reset_index(drop=True)
+
+        df_balanced.to_csv(dataset_file, index=False)
+        df = df_balanced
+        print("Successfully downloaded and balanced dataset!")
+    except Exception as e:
+        print(f"Error downloading dataset: {e}")
+        print("Please manually download the CICIDS2017 dataset and place it as 'cicids2017_real_sample.csv' in the project directory.")
+        exit(1)
+else:
+    df = pd.read_csv(dataset_file)
 
 # Ensure dataset size is manageable but large enough
 if len(df) > 200000:
     # Stratified downsample to 200k to ensure KNN and RF train in reasonable time
-    # (KNN takes forever on 600k samples)
     df = df.groupby('Label', group_keys=False).apply(lambda x: x.sample(min(len(x), int(200000 * len(x)/len(df))), random_state=42))
 
 feature_mapping = {
@@ -33,7 +56,7 @@ feature_mapping = {
     'Fwd Packet Length Max': 'Fwd Packet Length Max',
     'Fwd Packet Length Min': 'Fwd Packet Length Min',
     'Bwd Packet Length Max': 'Bwd Packet Length Max',
-    'Bwd Packet Length Min': 'Bwd Packet Min', # Note: 'Bwd Packet Min' should map to 'Bwd Packet Length Min'
+    'Bwd Packet Length Min': 'Bwd Packet Length Min',
     'Flow Bytes/s': 'Flow Bytes/s',
     'Flow Packets/s': 'Flow Packets/s',
     'FIN Flag Count': 'FIN Flag Count',
@@ -42,9 +65,6 @@ feature_mapping = {
     'PSH Flag Count': 'PSH Flag Count',
     'ACK Flag Count': 'ACK Flag Count'
 }
-
-# The actual column name in bvk dataset might be slightly different. Let's fix mapping
-feature_mapping['Bwd Packet Length Min'] = 'Bwd Packet Length Min'
 
 df.rename(columns=feature_mapping, inplace=True)
 FEATURES = list(feature_mapping.values())
@@ -96,7 +116,6 @@ X_scaled = scaler.fit_transform(X)
 X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_encoded, test_size=0.3, random_state=42, stratify=y_encoded)
 
 # 3. Train Models
-# Including KNN as explicitly requested by the user previously
 models = {
     "Random Forest": RandomForestClassifier(n_estimators=50, max_depth=15, n_jobs=-1, random_state=42),
     "XGBoost": xgb.XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=42, n_jobs=-1, max_depth=8),
