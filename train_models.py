@@ -44,7 +44,6 @@ else:
 
 # Ensure dataset size is manageable but large enough
 if len(df) > 200000:
-    # Stratified downsample to 200k to ensure KNN and RF train in reasonable time
     df = df.groupby('Label', group_keys=False).apply(lambda x: x.sample(min(len(x), int(200000 * len(x)/len(df))), random_state=42))
 
 feature_mapping = {
@@ -110,10 +109,12 @@ y = df['Label']
 encoder = LabelEncoder()
 y_encoded = encoder.fit_transform(y)
 
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
+# Perform split BEFORE scaling to prevent data leakage from test set to training set scaler
+X_train, X_test, y_train, y_test = train_test_split(X, y_encoded, test_size=0.3, random_state=42, stratify=y_encoded)
 
-X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_encoded, test_size=0.3, random_state=42, stratify=y_encoded)
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
 
 # 3. Train Models
 models = {
@@ -128,8 +129,8 @@ best_name = ""
 
 for name, model in models.items():
     print(f"\nTraining {name}...")
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
+    model.fit(X_train_scaled, y_train)
+    y_pred = model.predict(X_test_scaled)
 
     acc = accuracy_score(y_test, y_pred)
     print(f"{name} Accuracy: {acc:.4f}")
@@ -142,7 +143,7 @@ for name, model in models.items():
 print(f"\nBest Model: {best_name} with Accuracy {best_accuracy:.4f}")
 
 print("\nClassification Report (Real-Time Attack Types):")
-y_pred_best = best_model.predict(X_test)
+y_pred_best = best_model.predict(X_test_scaled)
 print(classification_report(y_test, y_pred_best))
 
 # 4. Save Artifacts

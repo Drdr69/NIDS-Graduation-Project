@@ -230,6 +230,9 @@ def analyze_active_flows():
                     pass
 
 def csv_writer():
+    global OUTPUT_FILE
+
+    header = ["Flow ID", "Timestamp", "Source IP", "Dest IP", "Protocol", "Total Packets", "Total Bytes", "Flow Duration (s)", "Packets/s", "Bytes/s", "Prediction", "Probability"]
     """ Background thread continuously batch-writing queued predictions to the CSV. """
     while True:
         try:
@@ -241,7 +244,10 @@ def csv_writer():
                 results.append(write_queue.get_nowait())
 
             df = pd.DataFrame(results)
-            df.to_csv(OUTPUT_FILE, mode='a', header=False, index=False)
+            if not os.path.exists(OUTPUT_FILE):
+                df.to_csv(OUTPUT_FILE, mode='w', header=header, index=False)
+            else:
+                df.to_csv(OUTPUT_FILE, mode='a', header=False, index=False)
 
             for _ in range(len(results)):
                 write_queue.task_done()
