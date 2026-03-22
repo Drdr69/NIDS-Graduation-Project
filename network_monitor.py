@@ -10,16 +10,13 @@ import warnings
 import queue
 import hashlib
 import shap
-
 import nips_mitigation
 from collections import defaultdict
 
-# NIPS active tracker
-suspicious_ips = defaultdict(int)
-NIPS_THRESHOLD = 3 # Block IP after 3 attacks
 warnings.filterwarnings('ignore')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PAUSE_FILE = os.path.join(BASE_DIR, '.pause_monitor')
 
 # Load ML components
 try:
@@ -42,77 +39,57 @@ def init_csv():
         df = pd.DataFrame(columns=[
             'Flow ID', 'Timestamp', 'Source IP', 'Dest IP', 'Protocol',
             'Total Packets', 'Total Bytes', 'Flow Duration (s)', 'Packets/s', 'Bytes/s',
-            'Prediction', 'Probability', 'Detection Engine', 'XAI Explanation'
+            'Prediction', 'Probability', 'Detection Engine', 'XAI Explanation', 'Mitigation Status'
         ])
         df.to_csv(OUTPUT_FILE, index=False)
 
 active_flows = {}
 flow_lock = threading.Lock()
 write_queue = queue.Queue()
+suspicious_ips = defaultdict(int)
+NIPS_THRESHOLD = 3 # Block IP after 3 attacks
 
-# Initialize SHAP TreeExplainer for Explainable AI (XAI)
-# Random Forest allows fast tree-based explainers
 explainer = shap.TreeExplainer(model)
 
+def is_paused():
+    return os.path.exists(PAUSE_FILE)
+
 def fast_path_signature_match(flow_data):
-    """
-    Hybrid Detection Engine (Fast Path)
-    Before heavy ML inference, check for obvious static signatures (Snort-style).
-    Returns (True, 'Prediction_String') if matched, else (False, None).
-    """
     pkts = flow_data['fwd_packets'] + flow_data['bwd_packets']
     dur = max(flow_data['last_time'] - flow_data['start_time'], 0.000001)
     rate = pkts / dur
 
-    # 1. Obvious volumetric DoS/DDoS (e.g. hping3 flood, > 10,000 pkts/sec)
     if rate > 10000:
         return True, "DDoS (Signature)"
-
-    # 2. SYN Flood (High SYN count, zero ACK/FIN, high rate)
     if flow_data['syn_flag'] == 1 and flow_data['ack_flag'] == 0 and flow_data['fin_flag'] == 0 and rate > 500:
         return True, "DoS Hulk (Signature)"
-
-    # 3. Aggressive PortScan (Extremely short duration, 1-2 packets, typical Nmap ping)
     if pkts <= 3 and dur < 0.1 and flow_data['fwd_length'] == 0:
         return True, "PortScan (Signature)"
 
     return False, None
 
 def generate_xai_explanation(scaled_features, prediction):
-    """
-    Explainable AI (XAI)
-    Uses SHAP to determine exactly which top 2 features caused this specific classification.
-    """
     if prediction == 'BENIGN' or 'Signature' in prediction:
         return "N/A"
-
     try:
-        # Calculate SHAP values for the specific flow
         shap_values = explainer.shap_values(scaled_features)
-
-        # shap_values is a list of arrays (one for each class). We need the class index.
         pred_idx = encoder.transform([prediction])[0]
-        class_shap_values = shap_values[pred_idx][0] # Get values for the predicted class
-
-        # Map feature importance
-        feature_importance = pd.DataFrame({
-            'Feature': FEATURES,
-            'Importance': class_shap_values
-        })
-
-        # Sort by absolute magnitude to find what drove the decision the most
+        class_shap_values = shap_values[pred_idx][0]
+        feature_importance = pd.DataFrame({'Feature': FEATURES, 'Importance': class_shap_values})
         top_features = feature_importance.reindex(feature_importance.Importance.abs().sort_values(ascending=False).index).head(2)
-
         reasons = []
         for _, row in top_features.iterrows():
             direction = "high" if row['Importance'] > 0 else "low"
             reasons.append(f"{row['Feature']} was unusually {direction}")
-
         return " flagged because " + " and ".join(reasons)
     except Exception as e:
         return f"XAI Error: {str(e)[:50]}"
 
 def packet_callback(pkt):
+    # Only process packets if the dashboard has not paused the engine
+    if is_paused():
+        return
+
     if IP in pkt and (TCP in pkt or UDP in pkt):
         timestamp = float(pkt.time)
         length = len(pkt)
@@ -198,12 +175,10 @@ def predict_flow(flow):
     total_packets = flow['fwd_packets'] + flow['bwd_packets']
     total_bytes = flow['fwd_length'] + flow['bwd_length']
 
-    # 1. Try Hybrid Fast-Path Signature Match
     is_match, sig_prediction = fast_path_signature_match(flow)
     if is_match:
-        return sig_prediction, 1.0, duration_sec, total_packets, total_bytes, "Signature Engine", "N/A"
+        return sig_prediction, 1.0, duration_sec, total_packets, total_bytes, "Signature Fast-Path", "N/A"
 
-    # 2. Fallback to Deep ML Inspection
     features = [
         flow_duration_us,
         flow['fwd_packets'],
@@ -230,17 +205,19 @@ def predict_flow(flow):
     prob = max(model.predict_proba(scaled_features)[0])
     prediction = encoder.inverse_transform([pred_idx])[0]
 
-    # 3. Generate XAI if it's a threat
     xai_reason = "N/A"
     if prediction != 'BENIGN':
         xai_reason = generate_xai_explanation(scaled_features, prediction)
 
-    return prediction, prob, duration_sec, total_packets, total_bytes, "ML Engine", xai_reason
+    return prediction, prob, duration_sec, total_packets, total_bytes, "Deep ML Model", xai_reason
 
 def analyze_active_flows():
     FLOW_TIMEOUT = 120.0
     while True:
         time.sleep(2.0)
+
+        if is_paused():
+            continue
 
         flows_to_process = []
         current_time = time.time()
@@ -271,6 +248,16 @@ def analyze_active_flows():
                     bytes_per_s = total_bytes / duration_sec
                     packets_per_s = total_packets / duration_sec
 
+                    mitigation = "None"
+                    if prediction != 'BENIGN':
+                        suspicious_ips[key[0]] += 1
+                        if suspicious_ips[key[0]] >= NIPS_THRESHOLD:
+                            blocked = nips_mitigation.block_ip(key[0], reason=f"Detected {prediction} attack via {engine}")
+                            mitigation = "System Firewall Block Applied" if blocked else "Failed to Block / Ignored Local"
+                            suspicious_ips[key[0]] = 0
+                        else:
+                            mitigation = f"Monitoring ({suspicious_ips[key[0]]}/{NIPS_THRESHOLD} strikes)"
+
                     result = {
                         'Flow ID': flow['flow_id'],
                         'Timestamp': timestamp,
@@ -285,26 +272,20 @@ def analyze_active_flows():
                         'Prediction': prediction,
                         'Probability': f"{prob:.4f}",
                         'Detection Engine': engine,
-                        'XAI Explanation': xai
+                        'XAI Explanation': xai,
+                        'Mitigation Status': mitigation
                     }
 
                     write_queue.put(result)
 
                     if prediction != 'BENIGN' or prob < 0.90:
-                        print(f"[{timestamp}] [ALERT] {key[0]} -> {key[2]} | {prediction} ({prob:.2f}) | Engine: {engine} | XAI: {xai}")
-
-                    # Active Mitigation NIPS Logic
-                    if prediction != 'BENIGN':
-                        suspicious_ips[key[0]] += 1
-                        if suspicious_ips[key[0]] >= NIPS_THRESHOLD:
-                            nips_mitigation.block_ip(key[0], reason=f"Detected {prediction} attack")
-                            suspicious_ips[key[0]] = 0 # Reset after block attempt
+                        print(f"[{timestamp}] [ALERT] {key[0]} -> {key[2]} | {prediction} ({prob:.2f}) | {engine}")
                 except Exception as e:
                     pass
 
 def csv_writer():
     global OUTPUT_FILE
-    header = ["Flow ID", "Timestamp", "Source IP", "Dest IP", "Protocol", "Total Packets", "Total Bytes", "Flow Duration (s)", "Packets/s", "Bytes/s", "Prediction", "Probability", "Detection Engine", "XAI Explanation"]
+    header = ["Flow ID", "Timestamp", "Source IP", "Dest IP", "Protocol", "Total Packets", "Total Bytes", "Flow Duration (s)", "Packets/s", "Bytes/s", "Prediction", "Probability", "Detection Engine", "XAI Explanation", "Mitigation Status"]
     while True:
         try:
             results = []
@@ -328,8 +309,15 @@ def csv_writer():
             print(f"CSV Writer Error: {e}")
 
 def start_sniffer():
-    print("Starting LIVE network monitor with Hybrid Engine & XAI...")
+    print("Starting LIVE network monitor with Hybrid Engine & NIPS Active Mitigation...")
     init_csv()
+
+    # Ensure pause file is cleared on startup so we start sniffing immediately
+    if os.path.exists(PAUSE_FILE):
+        try:
+            os.remove(PAUSE_FILE)
+        except:
+            pass
 
     analyzer = threading.Thread(target=analyze_active_flows, daemon=True)
     analyzer.start()

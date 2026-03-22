@@ -22,7 +22,9 @@ def start_services():
     monitor_process = subprocess.Popen([sys.executable, "network_monitor.py"], stdout=sys.stdout, stderr=sys.stderr)
     print(f"Network monitor started (PID: {monitor_process.pid})")
 
-    dashboard_process = subprocess.Popen(["streamlit", "run", "dashboard.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # We use sys.executable -m to robustly locate and launch streamlit even when running under sudo
+    # or inside specific Windows virtual environments where the PATH variable might be stripped or mismatched.
+    dashboard_process = subprocess.Popen([sys.executable, "-m", "streamlit", "run", "dashboard.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f"Streamlit dashboard started (PID: {dashboard_process.pid})")
     print("\nSetup complete! Go to http://localhost:8501 in your browser to view the dashboard.\n")
 
