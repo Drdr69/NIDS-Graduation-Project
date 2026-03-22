@@ -5,7 +5,10 @@ import pickle
 import pandas as pd
 from scapy.all import rdpcap, IP, TCP, UDP
 from datetime import datetime
+import warnings
+import shap
 
+warnings.filterwarnings('ignore')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -22,12 +25,51 @@ except FileNotFoundError as e:
     print(f"Model files not found. Error: {e}")
     sys.exit(1)
 
+# SHAP Explainer
+explainer = shap.TreeExplainer(model)
+
+def fast_path_signature_match(flow_data):
+    pkts = flow_data['fwd_packets'] + flow_data['bwd_packets']
+    dur = max(flow_data['last_time'] - flow_data['start_time'], 0.000001)
+    rate = pkts / dur
+
+    if rate > 10000:
+        return True, "DDoS (Signature)"
+    if flow_data['syn_flag'] == 1 and flow_data['ack_flag'] == 0 and flow_data['fin_flag'] == 0 and rate > 500:
+        return True, "DoS Hulk (Signature)"
+    if pkts <= 3 and dur < 0.1 and flow_data['fwd_length'] == 0:
+        return True, "PortScan (Signature)"
+
+    return False, None
+
+def generate_xai_explanation(scaled_features, prediction):
+    if prediction == 'BENIGN' or 'Signature' in prediction:
+        return "N/A"
+    try:
+        shap_values = explainer.shap_values(scaled_features)
+        pred_idx = encoder.transform([prediction])[0]
+        class_shap_values = shap_values[pred_idx][0]
+        feature_importance = pd.DataFrame({'Feature': FEATURES, 'Importance': class_shap_values})
+        top_features = feature_importance.reindex(feature_importance.Importance.abs().sort_values(ascending=False).index).head(2)
+        reasons = []
+        for _, row in top_features.iterrows():
+            direction = "high" if row['Importance'] > 0 else "low"
+            reasons.append(f"{row['Feature']} was unusually {direction}")
+        return " flagged because " + " and ".join(reasons)
+    except Exception as e:
+        return f"XAI Error: {str(e)[:50]}"
+
 def extract_features_from_flow(flow):
     duration_sec = max(flow['last_time'] - flow['start_time'], 0.000001)
     flow_duration_us = duration_sec * 1e6
 
     total_packets = flow['fwd_packets'] + flow['bwd_packets']
     total_bytes = flow['fwd_length'] + flow['bwd_length']
+
+    # 1. Signature Check
+    is_match, sig_pred = fast_path_signature_match(flow)
+    if is_match:
+        return None, duration_sec, total_packets, total_bytes, sig_pred, "Signature Engine", "N/A"
 
     features = [
         flow_duration_us,
@@ -47,55 +89,82 @@ def extract_features_from_flow(flow):
         flow['psh_flag'],
         flow['ack_flag']
     ]
-    return features, duration_sec, total_packets, total_bytes
+    return features, duration_sec, total_packets, total_bytes, None, "ML Engine", None
 
 def predict_flows(flows_dict):
     results = []
     if not flows_dict:
         return results
 
-    features_list = []
-    keys_list = []
-    meta_list = []
+    ml_features_list = []
+    ml_keys_list = []
+    ml_meta_list = []
 
     for key, flow in flows_dict.items():
-        feats, duration_sec, total_packets, total_bytes = extract_features_from_flow(flow)
-        features_list.append(feats)
-        keys_list.append((key, flow['last_time']))
-        meta_list.append((duration_sec, total_packets, total_bytes))
+        feats, duration_sec, total_packets, total_bytes, sig_pred, engine, xai = extract_features_from_flow(flow)
 
-    feature_df = pd.DataFrame(features_list, columns=FEATURES)
-    scaled_features = scaler.transform(feature_df)
-
-    predictions_idx = model.predict(scaled_features)
-    probabilities = model.predict_proba(scaled_features).max(axis=1)
-    predictions = encoder.inverse_transform(predictions_idx)
-
-    for i, (key, last_time) in enumerate(keys_list):
-        dt_time = datetime.fromtimestamp(last_time).strftime('%Y-%m-%d %H:%M:%S')
-        duration_sec, total_packets, total_bytes = meta_list[i]
+        # Exact duplicate hash ID from network_monitor
+        src_ip, src_port, dst_ip, dst_port, proto = key
+        flow_id_str = f"{min(src_ip, dst_ip)}-{max(src_ip, dst_ip)}-{min(src_port, dst_port)}-{max(src_port, dst_port)}-{proto}"
+        flow_id = hashlib.md5(flow_id_str.encode()).hexdigest()[:8]
+        dt_time = datetime.fromtimestamp(flow['last_time']).strftime('%Y-%m-%d %H:%M:%S')
 
         bytes_per_s = total_bytes / duration_sec
         packets_per_s = total_packets / duration_sec
 
-        src_ip, src_port, dst_ip, dst_port, proto = key
-        flow_id_str = f"{min(src_ip, dst_ip)}-{max(src_ip, dst_ip)}-{min(src_port, dst_port)}-{max(src_port, dst_port)}-{proto}"
-        flow_id = hashlib.md5(flow_id_str.encode()).hexdigest()[:8]
+        if sig_pred: # Handled by Fast Path
+            results.append({
+                'Flow ID': flow_id,
+                'Timestamp': dt_time,
+                'Source IP': src_ip,
+                'Dest IP': dst_ip,
+                'Protocol': proto,
+                'Total Packets': total_packets,
+                'Total Bytes': total_bytes,
+                'Flow Duration (s)': f"{duration_sec:.2f}",
+                'Packets/s': f"{packets_per_s:.2f}",
+                'Bytes/s': f"{bytes_per_s:.2f}",
+                'Prediction': sig_pred,
+                'Probability': "1.0000",
+                'Detection Engine': engine,
+                'XAI Explanation': xai
+            })
+        else: # Needs ML
+            ml_features_list.append(feats)
+            ml_keys_list.append((key, flow_id, dt_time, src_ip, dst_ip, proto))
+            ml_meta_list.append((duration_sec, total_packets, total_bytes, packets_per_s, bytes_per_s))
 
-        results.append({
-            'Flow ID': flow_id,
-            'Timestamp': dt_time,
-            'Source IP': src_ip,
-            'Dest IP': dst_ip,
-            'Protocol': proto,
-            'Total Packets': total_packets,
-            'Total Bytes': total_bytes,
-            'Flow Duration (s)': f"{duration_sec:.2f}",
-            'Packets/s': f"{packets_per_s:.2f}",
-            'Bytes/s': f"{bytes_per_s:.2f}",
-            'Prediction': predictions[i],
-            'Probability': f"{probabilities[i]:.4f}"
-        })
+    if ml_features_list:
+        feature_df = pd.DataFrame(ml_features_list, columns=FEATURES)
+        scaled_features = scaler.transform(feature_df)
+
+        predictions_idx = model.predict(scaled_features)
+        probabilities = model.predict_proba(scaled_features).max(axis=1)
+        predictions = encoder.inverse_transform(predictions_idx)
+
+        for i, (key, flow_id, dt_time, src_ip, dst_ip, proto) in enumerate(ml_keys_list):
+            duration_sec, total_packets, total_bytes, packets_per_s, bytes_per_s = ml_meta_list[i]
+
+            xai_reason = "N/A"
+            if predictions[i] != 'BENIGN':
+                xai_reason = generate_xai_explanation([scaled_features[i]], predictions[i])
+
+            results.append({
+                'Flow ID': flow_id,
+                'Timestamp': dt_time,
+                'Source IP': src_ip,
+                'Dest IP': dst_ip,
+                'Protocol': proto,
+                'Total Packets': total_packets,
+                'Total Bytes': total_bytes,
+                'Flow Duration (s)': f"{duration_sec:.2f}",
+                'Packets/s': f"{packets_per_s:.2f}",
+                'Bytes/s': f"{bytes_per_s:.2f}",
+                'Prediction': predictions[i],
+                'Probability': f"{probabilities[i]:.4f}",
+                'Detection Engine': "ML Engine",
+                'XAI Explanation': xai_reason
+            })
 
     return results
 

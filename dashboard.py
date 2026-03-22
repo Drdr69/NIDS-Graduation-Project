@@ -94,7 +94,7 @@ min_prob = st.sidebar.slider("Minimum Confidence (%)", 0, 100, 50)
 
 if st.sidebar.button("🗑️ Clear All Network Data", use_container_width=True):
     if os.path.exists(PREDICTIONS_FILE):
-        pd.DataFrame(columns=['Flow ID', 'Timestamp', 'Source IP', 'Dest IP', 'Protocol', 'Total Packets', 'Total Bytes', 'Flow Duration (s)', 'Packets/s', 'Bytes/s', 'Prediction', 'Probability']).to_csv(PREDICTIONS_FILE, index=False)
+        pd.DataFrame(columns=['Flow ID', 'Timestamp', 'Source IP', 'Dest IP', 'Protocol', 'Total Packets', 'Total Bytes', 'Flow Duration (s)', 'Packets/s', 'Bytes/s', 'Prediction', 'Probability', 'Detection Engine', 'XAI Explanation']).to_csv(PREDICTIONS_FILE, index=False)
     st.rerun()
 
 # --- Main Dashboard Header ---
@@ -240,7 +240,7 @@ else:
             st.subheader("Raw Network Flow Intelligence")
             st.caption("Deep inspection of the most recent active network connections. Sorted by newest first.")
 
-            display_cols = ['Timestamp', 'Source IP', 'Dest IP', 'Protocol', 'Total Packets', 'Total Bytes', 'Flow Duration (s)', 'Packets/s', 'Bytes/s', 'Prediction', 'Probability']
+            display_cols = ['Timestamp', 'Source IP', 'Dest IP', 'Protocol', 'Total Packets', 'Total Bytes', 'Flow Duration (s)', 'Packets/s', 'Bytes/s', 'Prediction', 'Probability', 'Detection Engine', 'XAI Explanation']
             available_cols = [col for col in display_cols if col in df.columns]
 
             # Show the last 1000 flows for performance, newest first

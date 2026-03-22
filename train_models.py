@@ -5,7 +5,7 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
 import xgboost as xgb
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, precision_score, recall_score, f1_score, confusion_matrix
 import pickle
 import os
 
@@ -133,7 +133,26 @@ for name, model in models.items():
     y_pred = model.predict(X_test_scaled)
 
     acc = accuracy_score(y_test, y_pred)
+
+    # Calculate advanced academic metrics
+    precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+    recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+    f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+
+    # Calculate False Positive Rate (FPR) safely
+    cm = confusion_matrix(y_test, y_pred)
+    FP = cm.sum(axis=0) - np.diag(cm)
+    FN = cm.sum(axis=1) - np.diag(cm)
+    TP = np.diag(cm)
+    TN = cm.sum() - (FP + FN + TP)
+    FPR = FP.sum() / (FP.sum() + TN.sum()) if (FP.sum() + TN.sum()) > 0 else 0
+
     print(f"{name} Accuracy: {acc:.4f}")
+    print(f"{name} Precision: {precision:.4f}")
+    print(f"{name} Recall: {recall:.4f}")
+    print(f"{name} F1-Score: {f1:.4f}")
+    print(f"{name} False Positive Rate: {FPR:.4f}")
+
 
     if acc > best_accuracy:
         best_accuracy = acc
